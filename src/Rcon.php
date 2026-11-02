@@ -38,7 +38,7 @@ use function socket_create;
 use function socket_create_pair;
 use function socket_last_error;
 use function socket_listen;
-use function socket_set_block;
+use function socket_set_nonblock;
 use function socket_set_option;
 use function socket_strerror;
 use function socket_write;
@@ -79,7 +79,8 @@ class Rcon implements NetworkInterface{
 			throw new RconException('Failed to open main socket: ' . trim(socket_strerror(socket_last_error())));
 		}
 
-		socket_set_block($this->socket);
+		//a client can vanish between select() and accept(), which would block a blocking accept() forever
+		socket_set_nonblock($this->socket);
 
 		$ret = @socket_create_pair(AF_UNIX, SOCK_STREAM, 0, $ipc);
 		if(!$ret){

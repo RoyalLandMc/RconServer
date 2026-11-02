@@ -49,9 +49,16 @@ use function trim;
 use const SO_KEEPALIVE;
 use const SO_LINGER;
 use const SOCKET_ECONNRESET;
+use const SOCKET_EWOULDBLOCK;
 use const SOL_SOCKET;
 
 class RconThread extends Thread{
+	/** Request ID + packet type + two null terminators */
+	private const MIN_PACKET_SIZE = 10;
+	/** Seconds a slow client may hold up this thread while a response is written */
+	private const WRITE_TIMEOUT = 5;
+	/** Seconds an authenticated client must be idle before a new connection may take its slot */
+	private const MIN_IDLE_TO_EVICT = 60;
 
 	public string $cmd = "";
 	public string $response = "";
@@ -67,18 +74,61 @@ class RconThread extends Thread{
 		private SleeperHandlerEntry $sleeperEntry
 	){}
 
-	private function writePacket(\Socket $client, int $requestID, int $packetType, string $payload) : void{
+	/**
+	 * Returns false if the client is gone or too slow to take the whole packet.
+	 */
+	private function writePacket(\Socket $client, int $requestID, int $packetType, string $payload) : bool{
 		$pk = Binary::writeLInt($requestID)
 			. Binary::writeLInt($packetType)
 			. $payload
 			. "\x00\x00"; //Terminate payload and packet
-		socket_write($client, Binary::writeLInt(strlen($pk)) . $pk);
+		$buffer = Binary::writeLInt(strlen($pk)) . $pk;
+		$deadline = microtime(true) + self::WRITE_TIMEOUT;
+		while(true){
+			$written = @socket_write($client, $buffer);
+			if($written === false){
+				if(socket_last_error($client) !== SOCKET_EWOULDBLOCK){
+					return false;
+				}
+				$written = 0;
+			}
+			$buffer = substr($buffer, $written);
+			if($buffer === ""){
+				return true;
+			}
+			$remaining = $deadline - microtime(true);
+			if($remaining <= 0){
+				return false;
+			}
+			$r = null;
+			$w = [$client];
+			$e = null;
+			@socket_select($r, $w, $e, 0, (int) ($remaining * 1_000_000));
+		}
+	}
+
+	/**
+	 * Finds the client to drop for a new connection when all slots are taken. Clients which died without closing the
+	 * connection never time out by themselves, so without this they would eventually lock everyone out.
+	 *
+	 * @param bool[]  $authenticated
+	 * @param float[] $lastActivity
+	 */
+	private function findIdleClient(array $authenticated, array $lastActivity) : ?int{
+		$best = null;
+		$cutoff = microtime(true) - self::MIN_IDLE_TO_EVICT;
+		foreach($authenticated as $id => $status){
+			if($status && $lastActivity[$id] <= $cutoff && ($best === null || $lastActivity[$id] < $lastActivity[$best])){
+				$best = $id;
+			}
+		}
+		return $best;
 	}
 
 	private function readPacket(\Socket $client, ?int &$requestID, ?int &$packetType, ?string &$payload) : bool{
 		$d = @socket_read($client, 4);
 
-		socket_getpeername($client, $ip, $port);
+		@socket_getpeername($client, $ip, $port);
 		if($d === false){
 			$err = socket_last_error($client);
 			if($err !== SOCKET_ECONNRESET){
@@ -93,8 +143,8 @@ class RconThread extends Thread{
 			return false;
 		}
 		$size = Binary::readLInt($d);
-		if($size < 0 or $size > 65535){
-			$this->logger->debug("Packet with too-large length header $size from $ip $port, disconnecting");
+		if($size < self::MIN_PACKET_SIZE or $size > 65535){
+			$this->logger->debug("Packet with invalid length header $size from $ip $port, disconnecting");
 			return false;
 		}
 		$buf = @socket_read($client, $size);
@@ -126,6 +176,8 @@ class RconThread extends Thread{
 		$authenticated = [];
 		/** @var float[] $timeouts */
 		$timeouts = [];
+		/** @var float[] $lastActivity */
+		$lastActivity = [];
 
 		/** @var int $nextClientId */
 		$nextClientId = 0;
@@ -141,13 +193,18 @@ class RconThread extends Thread{
 
 			$disconnect = [];
 
-			if(socket_select($r, $w, $e, 5, 0) > 0){
+			if(@socket_select($r, $w, $e, 5, 0) > 0){
 				foreach($r as $id => $sock){
 					if($sock === $this->socket){
-						if(($client = socket_accept($this->socket)) !== false){
-							if(count($clients) >= $this->maxClients){
+						if(($client = @socket_accept($this->socket)) !== false){
+							$full = count($clients) >= $this->maxClients;
+							$evict = $full ? $this->findIdleClient($authenticated, $lastActivity) : null;
+							if($full && $evict === null){
 								@socket_close($client);
 							}else{
+								if($evict !== null){
+									$disconnect[$evict] = $clients[$evict];
+								}
 								socket_set_nonblock($client);
 								socket_set_option($client, SOL_SOCKET, SO_KEEPALIVE, 1);
 
@@ -155,6 +212,7 @@ class RconThread extends Thread{
 								$clients[$id] = $client;
 								$authenticated[$id] = false;
 								$timeouts[$id] = microtime(true) + 5;
+								$lastActivity[$id] = microtime(true);
 							}
 						}
 					}elseif($sock === $this->ipcSocket){
@@ -166,6 +224,7 @@ class RconThread extends Thread{
 							$disconnect[$id] = $sock;
 							continue;
 						}
+						$lastActivity[$id] = microtime(true);
 
 						switch($packetType){
 							case 3: //Login
@@ -173,10 +232,13 @@ class RconThread extends Thread{
 									$disconnect[$id] = $sock;
 									break;
 								}
-								socket_getpeername($sock, $addr, $port);
+								@socket_getpeername($sock, $addr, $port);
 								if($payload === $this->password){
 									$this->logger->info("Successful Rcon connection from: /$addr:$port");
-									$this->writePacket($sock, $requestID, 2, "");
+									if(!$this->writePacket($sock, $requestID, 2, "")){
+										$disconnect[$id] = $sock;
+										break;
+									}
 									$authenticated[$id] = true;
 								}else{
 									$disconnect[$id] = $sock;
@@ -195,7 +257,9 @@ class RconThread extends Thread{
 										$notifier->wakeupSleeper();
 										$this->wait();
 									});
-									$this->writePacket($sock, $requestID, 0, str_replace("\n", "\r\n", trim($this->response)));
+									if(!$this->writePacket($sock, $requestID, 0, str_replace("\n", "\r\n", trim($this->response)))){
+										$disconnect[$id] = $sock;
+									}
 									$this->response = "";
 									$this->cmd = "";
 								}
@@ -213,7 +277,7 @@ class RconThread extends Thread{
 
 			foreach($disconnect as $id => $client){
 				$this->disconnectClient($client);
-				unset($clients[$id], $authenticated[$id], $timeouts[$id]);
+				unset($clients[$id], $authenticated[$id], $timeouts[$id], $lastActivity[$id]);
 			}
 		}
 
@@ -223,7 +287,7 @@ class RconThread extends Thread{
 	}
 
 	private function disconnectClient(\Socket $client) : void{
-		socket_getpeername($client, $ip, $port);
+		@socket_getpeername($client, $ip, $port);
 		@socket_set_option($client, SOL_SOCKET, SO_LINGER, ["l_onoff" => 1, "l_linger" => 1]);
 		@socket_shutdown($client, 2);
 		@socket_set_block($client);
